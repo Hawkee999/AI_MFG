@@ -12,15 +12,15 @@ __pycache__/
 .env
 .streamlit/secrets.toml
 
-# Local datasets - remove these lines if you intentionally
-# want to upload your datasets to GitHub
-Data/
-data/
+# # Local datasets - remove these lines if you intentionally
+# # want to upload your datasets to GitHub
+# Data/
+# data/
 
-# Generated model files - remove this line if you want
-# to upload your trained models and they are small enough
-models/
+# # Generated model files - remove this line if you want
+# # to upload your trained models and they are small enough
+# models/
 
-# Logs and temporary files
+# # Logs and temporary files
 *.log
 .DS_Store

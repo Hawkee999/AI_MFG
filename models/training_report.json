@@ -1,0 +1,558 @@
+{
+  "optional_dependencies": {
+    "catboost_available": true,
+    "xgboost_available": true,
+    "install_hint": "Install optional candidates with: pip install catboost xgboost"
+  },
+  "milling": {
+    "status": "trained",
+    "rows": 10000,
+    "targets": [
+      "Machine failure",
+      "TWF",
+      "HDF",
+      "PWF",
+      "OSF",
+      "RNF"
+    ],
+    "metrics": {
+      "Machine failure": {
+        "rows": 10000,
+        "class_counts": {
+          "0": 9661,
+          "1": 339
+        },
+        "selected_model": "XGBoost",
+        "selection_metric": "average_precision (PR-AUC approximation)",
+        "best_model_metrics": {
+          "average_precision": 0.8288249499331402,
+          "roc_auc": 0.9726738521495554,
+          "f1_at_0_5": 0.6787878787878788,
+          "precision_at_0_5": 0.5773195876288659,
+          "recall_at_0_5": 0.8235294117647058,
+          "accuracy_at_0_5": 0.9735
+        },
+        "model_comparison": {
+          "RandomForest": {
+            "average_precision": 0.7647279773583165,
+            "roc_auc": 0.967025940811107,
+            "f1_at_0_5": 0.6949152542372882,
+            "precision_at_0_5": 0.82,
+            "recall_at_0_5": 0.6029411764705882,
+            "accuracy_at_0_5": 0.982
+          },
+          "ExtraTrees": {
+            "average_precision": 0.6255362839230035,
+            "roc_auc": 0.9590488369260748,
+            "f1_at_0_5": 0.6086956521739131,
+            "precision_at_0_5": 0.5268817204301075,
+            "recall_at_0_5": 0.7205882352941176,
+            "accuracy_at_0_5": 0.9685
+          },
+          "CatBoost": {
+            "average_precision": 0.818434378441832,
+            "roc_auc": 0.9701086956521738,
+            "f1_at_0_5": 0.7142857142857143,
+            "precision_at_0_5": 0.6395348837209303,
+            "recall_at_0_5": 0.8088235294117647,
+            "accuracy_at_0_5": 0.978
+          },
+          "XGBoost": {
+            "average_precision": 0.8288249499331402,
+            "roc_auc": 0.9726738521495554,
+            "f1_at_0_5": 0.6787878787878788,
+            "precision_at_0_5": 0.5773195876288659,
+            "recall_at_0_5": 0.8235294117647058,
+            "accuracy_at_0_5": 0.9735
+          }
+        },
+        "warning": "Holdout metrics are used for model selection; use a separate untouched test set for final unbiased evaluation."
+      },
+      "TWF": {
+        "rows": 10000,
+        "class_counts": {
+          "0": 9954,
+          "1": 46
+        },
+        "selected_model": "RandomForest",
+        "selection_metric": "average_precision (PR-AUC approximation)",
+        "best_model_metrics": {
+          "average_precision": 0.06396304196483407,
+          "roc_auc": 0.9630001674200569,
+          "f1_at_0_5": 0.0,
+          "precision_at_0_5": 0.0,
+          "recall_at_0_5": 0.0,
+          "accuracy_at_0_5": 0.9955
+        },
+        "model_comparison": {
+          "RandomForest": {
+            "average_precision": 0.06396304196483407,
+            "roc_auc": 0.9630001674200569,
+            "f1_at_0_5": 0.0,
+            "precision_at_0_5": 0.0,
+            "recall_at_0_5": 0.0,
+            "accuracy_at_0_5": 0.9955
+          },
+          "ExtraTrees": {
+            "average_precision": 0.03706945672256847,
+            "roc_auc": 0.9293487359785703,
+            "f1_at_0_5": 0.0,
+            "precision_at_0_5": 0.0,
+            "recall_at_0_5": 0.0,
+            "accuracy_at_0_5": 0.993
+          },
+          "CatBoost": {
+            "average_precision": 0.052210292739054864,
+            "roc_auc": 0.9562475584575032,
+            "f1_at_0_5": 0.0,
+            "precision_at_0_5": 0.0,
+            "recall_at_0_5": 0.0,
+            "accuracy_at_0_5": 0.9895
+          },
+          "XGBoost": {
+            "average_precision": 0.05590066358916893,
+            "roc_auc": 0.9598191863385234,
+            "f1_at_0_5": 0.0,
+            "precision_at_0_5": 0.0,
+            "recall_at_0_5": 0.0,
+            "accuracy_at_0_5": 0.9895
+          }
+        },
+        "warning": "Holdout metrics are used for model selection; use a separate untouched test set for final unbiased evaluation."
+      },
+      "HDF": {
+        "rows": 10000,
+        "class_counts": {
+          "0": 9885,
+          "1": 115
+        },
+        "selected_model": "CatBoost",
+        "selection_metric": "average_precision (PR-AUC approximation)",
+        "best_model_metrics": {
+          "average_precision": 0.965093672675857,
+          "roc_auc": 0.9986584856282025,
+          "f1_at_0_5": 0.9333333333333333,
+          "precision_at_0_5": 0.9545454545454546,
+          "recall_at_0_5": 0.9130434782608695,
+          "accuracy_at_0_5": 0.9985
+        },
+        "model_comparison": {
+          "RandomForest": {
+            "average_precision": 0.9120022558080403,
+            "roc_auc": 0.9750830199467794,
+            "f1_at_0_5": 0.8292682926829268,
+            "precision_at_0_5": 0.9444444444444444,
+            "recall_at_0_5": 0.7391304347826086,
+            "accuracy_at_0_5": 0.9965
+          },
+          "ExtraTrees": {
+            "average_precision": 0.8548438485161078,
+            "roc_auc": 0.9947878867849838,
+            "f1_at_0_5": 0.6792452830188679,
+            "precision_at_0_5": 0.6,
+            "recall_at_0_5": 0.782608695652174,
+            "accuracy_at_0_5": 0.9915
+          },
+          "CatBoost": {
+            "average_precision": 0.965093672675857,
+            "roc_auc": 0.9986584856282025,
+            "f1_at_0_5": 0.9333333333333333,
+            "precision_at_0_5": 0.9545454545454546,
+            "recall_at_0_5": 0.9130434782608695,
+            "accuracy_at_0_5": 0.9985
+          },
+          "XGBoost": {
+            "average_precision": 0.9458604031317673,
+            "roc_auc": 0.9945239823184008,
+            "f1_at_0_5": 0.9130434782608695,
+            "precision_at_0_5": 0.9130434782608695,
+            "recall_at_0_5": 0.9130434782608695,
+            "accuracy_at_0_5": 0.998
+          }
+        },
+        "warning": "Holdout metrics are used for model selection; use a separate untouched test set for final unbiased evaluation."
+      },
+      "PWF": {
+        "rows": 10000,
+        "class_counts": {
+          "0": 9905,
+          "1": 95
+        },
+        "selected_model": "RandomForest",
+        "selection_metric": "average_precision (PR-AUC approximation)",
+        "best_model_metrics": {
+          "average_precision": 0.9211821502296329,
+          "roc_auc": 0.9989904088844018,
+          "f1_at_0_5": 0.7567567567567568,
+          "precision_at_0_5": 0.7777777777777778,
+          "recall_at_0_5": 0.7368421052631579,
+          "accuracy_at_0_5": 0.9955
+        },
+        "model_comparison": {
+          "RandomForest": {
+            "average_precision": 0.9211821502296329,
+            "roc_auc": 0.9989904088844018,
+            "f1_at_0_5": 0.7567567567567568,
+            "precision_at_0_5": 0.7777777777777778,
+            "recall_at_0_5": 0.7368421052631579,
+            "accuracy_at_0_5": 0.9955
+          },
+          "ExtraTrees": {
+            "average_precision": 0.8845440403516627,
+            "roc_auc": 0.9980073859560562,
+            "f1_at_0_5": 0.7272727272727273,
+            "precision_at_0_5": 0.64,
+            "recall_at_0_5": 0.8421052631578947,
+            "accuracy_at_0_5": 0.994
+          },
+          "CatBoost": {
+            "average_precision": 0.8855388144114524,
+            "roc_auc": 0.9985387497011079,
+            "f1_at_0_5": 0.72,
+            "precision_at_0_5": 0.5806451612903226,
+            "recall_at_0_5": 0.9473684210526315,
+            "accuracy_at_0_5": 0.993
+          },
+          "XGBoost": {
+            "average_precision": 0.7928497643176073,
+            "roc_auc": 0.9985653178883604,
+            "f1_at_0_5": 0.8444444444444444,
+            "precision_at_0_5": 0.7307692307692307,
+            "recall_at_0_5": 1.0,
+            "accuracy_at_0_5": 0.9965
+          }
+        },
+        "warning": "Holdout metrics are used for model selection; use a separate untouched test set for final unbiased evaluation."
+      },
+      "OSF": {
+        "rows": 10000,
+        "class_counts": {
+          "0": 9902,
+          "1": 98
+        },
+        "selected_model": "XGBoost",
+        "selection_metric": "average_precision (PR-AUC approximation)",
+        "best_model_metrics": {
+          "average_precision": 0.9330267320012022,
+          "roc_auc": 0.9989141414141414,
+          "f1_at_0_5": 0.8292682926829268,
+          "precision_at_0_5": 0.8095238095238095,
+          "recall_at_0_5": 0.85,
+          "accuracy_at_0_5": 0.9965
+        },
+        "model_comparison": {
+          "RandomForest": {
+            "average_precision": 0.7749921137587419,
+            "roc_auc": 0.9960858585858585,
+            "f1_at_0_5": 0.6451612903225806,
+            "precision_at_0_5": 0.9090909090909091,
+            "recall_at_0_5": 0.5,
+            "accuracy_at_0_5": 0.9945
+          },
+          "ExtraTrees": {
+            "average_precision": 0.6703617081833415,
+            "roc_auc": 0.9915151515151513,
+            "f1_at_0_5": 0.47619047619047616,
+            "precision_at_0_5": 0.45454545454545453,
+            "recall_at_0_5": 0.5,
+            "accuracy_at_0_5": 0.989
+          },
+          "CatBoost": {
+            "average_precision": 0.9291109938709512,
+            "roc_auc": 0.998989898989899,
+            "f1_at_0_5": 0.8095238095238095,
+            "precision_at_0_5": 0.7727272727272727,
+            "recall_at_0_5": 0.85,
+            "accuracy_at_0_5": 0.996
+          },
+          "XGBoost": {
+            "average_precision": 0.9330267320012022,
+            "roc_auc": 0.9989141414141414,
+            "f1_at_0_5": 0.8292682926829268,
+            "precision_at_0_5": 0.8095238095238095,
+            "recall_at_0_5": 0.85,
+            "accuracy_at_0_5": 0.9965
+          }
+        },
+        "warning": "Holdout metrics are used for model selection; use a separate untouched test set for final unbiased evaluation."
+      },
+      "RNF": {
+        "rows": 10000,
+        "class_counts": {
+          "0": 9981,
+          "1": 19
+        },
+        "selected_model": "ExtraTrees",
+        "selection_metric": "average_precision (PR-AUC approximation)",
+        "best_model_metrics": {
+          "average_precision": 0.1342133596004948,
+          "roc_auc": 0.6976452905811623,
+          "f1_at_0_5": 0.0,
+          "precision_at_0_5": 0.0,
+          "recall_at_0_5": 0.0,
+          "accuracy_at_0_5": 0.998
+        },
+        "model_comparison": {
+          "RandomForest": {
+            "average_precision": 0.021779639175257732,
+            "roc_auc": 0.6457915831663327,
+            "f1_at_0_5": 0.0,
+            "precision_at_0_5": 0.0,
+            "recall_at_0_5": 0.0,
+            "accuracy_at_0_5": 0.998
+          },
+          "ExtraTrees": {
+            "average_precision": 0.1342133596004948,
+            "roc_auc": 0.6976452905811623,
+            "f1_at_0_5": 0.0,
+            "precision_at_0_5": 0.0,
+            "recall_at_0_5": 0.0,
+            "accuracy_at_0_5": 0.998
+          },
+          "CatBoost": {
+            "average_precision": 0.08628093350073507,
+            "roc_auc": 0.6475450901803608,
+            "f1_at_0_5": 0.25,
+            "precision_at_0_5": 0.25,
+            "recall_at_0_5": 0.25,
+            "accuracy_at_0_5": 0.997
+          },
+          "XGBoost": {
+            "average_precision": 0.008294391287337494,
+            "roc_auc": 0.5970691382765532,
+            "f1_at_0_5": 0.0,
+            "precision_at_0_5": 0.0,
+            "recall_at_0_5": 0.0,
+            "accuracy_at_0_5": 0.997
+          }
+        },
+        "warning": "Holdout metrics are used for model selection; use a separate untouched test set for final unbiased evaluation."
+      }
+    }
+  },
+  "turning": {
+    "status": "trained",
+    "metrics": {
+      "rows": 2054,
+      "features": 152,
+      "selected_model": "ExtraTrees",
+      "selection_metric": "RMSE (lower is better)",
+      "mae": 3.752647785888069,
+      "rmse": 6.266426203890606,
+      "r2": 0.9969311612737329,
+      "model_comparison": {
+        "ExtraTrees": {
+          "mae": 3.752647785888072,
+          "rmse": 6.266426203890611,
+          "r2": 0.9969311612737329
+        },
+        "RandomForest": {
+          "mae": 6.995305303878642,
+          "rmse": 10.981444759470671,
+          "r2": 0.9905756117466377
+        },
+        "HistGradientBoosting": {
+          "mae": 6.234527897536543,
+          "rmse": 8.824006500882692,
+          "r2": 0.9939149262586484
+        },
+        "CatBoost": {
+          "mae": 6.284384806923741,
+          "rmse": 8.7302191078338,
+          "r2": 0.9940435912356279
+        },
+        "XGBoost": {
+          "mae": 6.020443541385252,
+          "rmse": 8.924420306187272,
+          "r2": 0.9937756466633482
+        }
+      },
+      "warning": "Random row split can overstate performance when nearby samples/runs are correlated; validate by tool/run before trusting this score."
+    },
+    "features": [
+      "AE_MAX",
+      "AE_KURT",
+      "AE_VAR",
+      "AE_RMS",
+      "AE_C_0.1",
+      "AE_C_0.15",
+      "AE_CF",
+      "Ax1_RMS",
+      "Ax1_SK",
+      "Ax1_MEAN",
+      "Ax1_MAX",
+      "Ax1_KURT",
+      "Ax2_RMS",
+      "Ax2_SK",
+      "Ax2_MEAN",
+      "Ax2_MAX",
+      "Ax2_KURT",
+      "Ay1_RMS",
+      "Ay1_SK",
+      "Ay1_MEAN",
+      "Ay1_MAX",
+      "Ay1_KURT",
+      "Ay2_RMS",
+      "Ay2_SK",
+      "Ay2_MEAN",
+      "Ay2_MAX",
+      "Ay2_KURT",
+      "Az1_RMS",
+      "Az1_SK",
+      "Az1_MEAN",
+      "Az1_MAX",
+      "Az1_KURT",
+      "Az2_RMS",
+      "Az2_SK",
+      "Az2_MEAN",
+      "Az2_MAX",
+      "Az2_KURT",
+      "F_p_RMS",
+      "F_p_SK",
+      "F_p_MEAN",
+      "F_p_MAX",
+      "F_p_KURT",
+      "F_f_RMS",
+      "F_f_SK",
+      "F_f_MEAN",
+      "F_f_MAX",
+      "F_f_KURT",
+      "F_c_RMS",
+      "F_c_SK",
+      "F_c_MEAN",
+      "F_c_MAX",
+      "F_c_KURT",
+      "Iu_s_RMS",
+      "Iu_s_SK",
+      "Iu_s_MEAN",
+      "Iu_s_MAX",
+      "Iu_s_KURT",
+      "Iu_x_RMS",
+      "Iu_x_SK",
+      "Iu_x_MEAN",
+      "Iu_x_MAX",
+      "Iu_x_KURT",
+      "Iv_s_RMS",
+      "Iv_s_SK",
+      "Iv_s_MEAN",
+      "Iv_s_MAX",
+      "Iv_s_KURT",
+      "Iv_x_RMS",
+      "Iv_x_SK",
+      "Iv_x_MEAN",
+      "Iv_x_MAX",
+      "Iv_x_KURT",
+      "Micro_RMS",
+      "Micro_SK",
+      "Micro_MEAN",
+      "Micro_MAX",
+      "Micro_KURT",
+      "Vu_s_RMS",
+      "Vu_s_SK",
+      "Vu_s_MEAN",
+      "Vu_s_MAX",
+      "Vu_s_KURT",
+      "Vu_x_RMS",
+      "Vu_x_SK",
+      "Vu_x_MEAN",
+      "Vu_x_MAX",
+      "Vu_x_KURT",
+      "Vv_s_RMS",
+      "Vv_s_SK",
+      "Vv_s_MEAN",
+      "Vv_s_MAX",
+      "Vv_s_KURT",
+      "Vv_x_RMS",
+      "Vv_x_SK",
+      "Vv_x_MEAN",
+      "Vv_x_MAX",
+      "Vv_x_KURT",
+      "Vw_s_RMS",
+      "Vw_s_SK",
+      "Vw_s_MEAN",
+      "Vw_s_MAX",
+      "Vw_s_KURT",
+      "Vw_x_RMS",
+      "Vw_x_SK",
+      "Vw_x_MEAN",
+      "Vw_x_MAX",
+      "Vw_x_KURT",
+      "TV50.S_RMS",
+      "TV50.S_SK",
+      "TV50.S_MEAN",
+      "TV50.S_MAX",
+      "TV50.S_KURT",
+      "TV51.S_RMS",
+      "TV51.S_SK",
+      "TV51.S_MEAN",
+      "TV51.S_MAX",
+      "TV51.S_KURT",
+      "TV2.S_RMS",
+      "TV2.S_SK",
+      "TV2.S_MEAN",
+      "TV2.S_MAX",
+      "TV2.S_KURT",
+      "TV2.X_RMS",
+      "TV2.X_SK",
+      "TV2.X_MEAN",
+      "TV2.X_MAX",
+      "TV2.X_KURT",
+      "TV2.Z_RMS",
+      "TV2.Z_SK",
+      "TV2.Z_MEAN",
+      "TV2.Z_MAX",
+      "TV2.Z_KURT",
+      "CV3.S_RMS",
+      "CV3.S_SK",
+      "CV3.S_MEAN",
+      "CV3.S_MAX",
+      "CV3.S_KURT",
+      "CV3.X_RMS",
+      "CV3.X_SK",
+      "CV3.X_MEAN",
+      "CV3.X_MAX",
+      "CV3.X_KURT",
+      "CV3.Z_RMS",
+      "CV3.Z_SK",
+      "CV3.Z_MEAN",
+      "CV3.Z_MAX",
+      "CV3.Z_KURT",
+      "CON.SV2.S",
+      "CON.SV2.X",
+      "CON.SV2.Z",
+      "CON.G.FREAL",
+      "CON.A.SREAL.S"
+    ]
+  },
+  "drilling": {
+    "status": "trained",
+    "metrics": {
+      "windows": 469,
+      "flagged_anomalies_in_training_data": 27,
+      "mean_anomaly_score": -0.07898217204081036
+    },
+    "feature_columns": [
+      "X_mean",
+      "X_std",
+      "X_rms",
+      "X_max_abs",
+      "X_peak_to_peak",
+      "X_skew",
+      "X_kurtosis",
+      "Y_mean",
+      "Y_std",
+      "Y_rms",
+      "Y_max_abs",
+      "Y_peak_to_peak",
+      "Y_skew",
+      "Y_kurtosis",
+      "Z_mean",
+      "Z_std",
+      "Z_rms",
+      "Z_max_abs",
+      "Z_peak_to_peak",
+      "Z_skew",
+      "Z_kurtosis"
+    ]
+  }
+}
