@@ -1,0 +1,16 @@
+# Core dashboard and data handling
+streamlit
+pandas
+numpy
+
+# Machine learning
+scikit-learn
+joblib
+catboost
+xgboost
+
+# Excel data support
+openpyxl
+
+# Charts
+plotly
