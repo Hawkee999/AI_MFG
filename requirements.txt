@@ -5,6 +5,7 @@ numpy
 
 # Machine learning
 scikit-learn
+imbalanced-learn
 joblib
 catboost
 xgboost
