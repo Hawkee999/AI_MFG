@@ -64,6 +64,10 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+VIEW_REPLAY = "Live replay (held-out test rows)"
+VIEW_MANUAL = "Manual prediction"
+VIEW_EVAL = "Model evaluation"
+
 FAILURE_DESCRIPTIONS = {
     "Machine failure": "Any recorded machine failure",
     "TWF": "Tool Wear Failure",
@@ -95,33 +99,220 @@ def display_name(name: str) -> str:
     return str(name).replace("_", " ").strip()
 
 
-def show_milling_result(result: dict) -> None:
+def show_milling_result(result: dict, actual: dict | None = None) -> None:
+    """Show failure / failure-mode predictions. `actual` (held-out replay only) adds true labels."""
     predictions = result.get("predictions", [])
     if not predictions:
         st.warning("The milling model returned no predictions.")
         return
-    failures = predictions[0].get("failures", {})
+    first = predictions[0]
+    failures = first.get("failures", {})
     if not failures:
         st.warning("No trained milling failure targets were found in the saved model.")
         return
 
-    st.markdown("#### Failure predictions")
+    st.markdown("#### Predicted failure and failure mode")
+    mode = first.get("predicted_failure_mode", "No failure")
+    if first.get("predicted_failure"):
+        text = f"**Failure predicted** · most likely mode: **{mode}** ({FAILURE_DESCRIPTIONS.get(mode, '')})"
+        if not first.get("failure_mode_confident", True):
+            text += " · low confidence: no individual mode reached the alert threshold"
+        st.error(text)
+        if len(first.get("flagged_modes", [])) > 1:
+            st.caption("Several modes are above the threshold: " + ", ".join(first["flagged_modes"]))
+    else:
+        st.success("**No failure predicted** at the current alert threshold.")
+
+    if actual:
+        actual_modes = [t for t in ("TWF", "HDF", "PWF", "OSF", "RNF") if actual.get(t) == 1]
+        st.info(
+            "**Actual (from the dataset):** "
+            + ("failure" if actual.get("Machine failure") == 1 else "no failure")
+            + (f" · mode(s): {', '.join(actual_modes)}" if actual_modes else "")
+        )
+
+    st.markdown("#### Per-target scores")
     rows = []
     for label, detail in failures.items():
-        rows.append({
+        row = {
             "Failure condition": label,
             "Description": FAILURE_DESCRIPTIONS.get(label, ""),
             "Selected model": detail.get("selected_model", "unknown"),
-            "Risk (%)": float(detail.get("risk_percent", 0.0)),
+            "Risk score (%)": float(detail.get("risk_percent", 0.0)),
             "Predicted failure": "Yes" if detail.get("predicted_failure") else "No",
-        })
+        }
+        if actual and label in actual:
+            row["Actual"] = "Yes" if actual[label] == 1 else "No"
+            row["Match"] = "✓" if bool(actual[label]) == bool(detail.get("predicted_failure")) else "✗"
+        rows.append(row)
     frame = pd.DataFrame(rows)
     st.dataframe(frame, hide_index=True, use_container_width=True)
     cols = st.columns(min(3, len(rows)))
     for index, row in enumerate(rows):
         with cols[index % len(cols)]:
-            st.metric(row["Failure condition"], f'{row["Risk (%)"]:.2f}%')
-    st.caption("Probabilities are model estimates, not guarantees. The alert threshold is configurable in the sidebar.")
+            st.metric(row["Failure condition"], f'{row["Risk score (%)"]:.2f}%')
+    st.caption(
+        "Scores are model estimates, not guarantees. The models were trained with SMOTE, so scores are not "
+        "calibrated probabilities. The alert threshold is configurable in the sidebar."
+    )
+
+
+def render_manual_milling(models: dict, model_info: dict, threshold: float) -> None:
+    """Form: enter a new milling datapoint and predict failure + failure mode."""
+    st.subheader("Manual prediction")
+    if "milling" not in models:
+        st.warning("Milling model is unavailable. Run `python model.py --operation milling` to train it.")
+        return
+    info = model_info.get("milling", {})
+    ranges = info.get("feature_ranges", {})
+    types = info.get("category_values", {}).get("Type") or ["L", "M", "H"]
+
+    def default(column: str, fallback: float) -> float:
+        return float(ranges[column]["median"]) if column in ranges else fallback
+
+    st.caption("Enter sensor values for a new datapoint. Defaults are the training-data medians.")
+    with st.form("manual_milling_form"):
+        left, right = st.columns(2)
+        product_type = left.selectbox("Product quality type", types, help="L = low, M = medium, H = high quality variant")
+        air = left.number_input("Air temperature [K]", min_value=0.0, value=round(default("Air temperature [K]", 300.0), 1), step=0.1, format="%.1f")
+        process = left.number_input("Process temperature [K]", min_value=0.0, value=round(default("Process temperature [K]", 310.0), 1), step=0.1, format="%.1f")
+        rpm = right.number_input("Rotational speed [rpm]", min_value=0.0, value=float(round(default("Rotational speed [rpm]", 1500.0))), step=1.0, format="%.0f")
+        torque = right.number_input("Torque [Nm]", min_value=0.0, value=round(default("Torque [Nm]", 40.0), 1), step=0.1, format="%.1f")
+        wear = right.number_input("Tool wear [min]", min_value=0.0, value=float(round(default("Tool wear [min]", 100.0))), step=1.0, format="%.0f")
+        submitted = st.form_submit_button("Predict failure and failure mode", type="primary")
+
+    if not submitted:
+        return
+    row = {
+        "Type": product_type,
+        "Air temperature [K]": air,
+        "Process temperature [K]": process,
+        "Rotational speed [rpm]": rpm,
+        "Torque [Nm]": torque,
+        "Tool wear [min]": wear,
+    }
+    outside = [
+        f"{column} = {row[column]:g} (training range {r['min']:g} to {r['max']:g})"
+        for column, r in ranges.items()
+        if column in row and not (r["min"] <= row[column] <= r["max"])
+    ]
+    if outside:
+        st.warning("Outside the range the model was trained on, so the prediction is an extrapolation: " + "; ".join(outside))
+    try:
+        result = predict_milling(row, models=models, threshold=threshold)
+    except Exception as exc:
+        st.error(f"Prediction failed: {exc}")
+        return
+    show_milling_result(result)
+    st.markdown("#### Sensor checks")
+    warnings = rule_based_warnings(row)
+    if warnings:
+        for warning in warnings:
+            st.warning(warning)
+    else:
+        st.success("No configured rule-based sensor warnings for these values.")
+    with st.expander("Submitted values"):
+        st.dataframe(pd.DataFrame([row]), hide_index=True, use_container_width=True)
+
+
+def _metric_row(name: str, e: dict) -> dict:
+    cm = e["confusion_matrix"]
+    return {
+        "Model": name, "Accuracy": e["accuracy"], "Precision": e["precision"], "Recall": e["recall"],
+        "F1": e["f1"], "ROC-AUC": e["roc_auc"], "PR-AUC": e["average_precision"],
+        "TP": cm["tp"], "FP": cm["fp"], "FN": cm["fn"], "TN": cm["tn"],
+    }
+
+
+def _confusion_figure(matrix, labels_x, labels_y, title: str):
+    fig = px.imshow(
+        matrix, x=labels_x, y=labels_y, text_auto=True, color_continuous_scale="Blues",
+        labels=dict(x="Predicted", y="Actual"), template="plotly_white", aspect="auto",
+    )
+    fig.update_layout(title=title, height=330, margin=dict(l=10, r=10, t=50, b=10), coloraxis_showscale=False)
+    return fig
+
+
+def render_milling_evaluation(bundle: dict | None) -> None:
+    """Held-out test-set metrics saved by model.py. Nothing here is computed in the UI."""
+    st.subheader("Model evaluation (held-out test set)")
+    metrics = (bundle or {}).get("metrics", {})
+    if not metrics or not any("test_rows" in m for m in metrics.values()):
+        st.warning("The saved milling model has no held-out evaluation. Retrain with `python model.py --operation milling`.")
+        return
+    split = bundle.get("split", {})
+    first = next(iter(metrics.values()))
+    st.caption(
+        f'Trained on {split.get("train_rows", "?"):,} rows, evaluated on {split.get("test_rows", "?"):,} rows the models never saw. '
+        f'Imbalance handling: {first["resampling"]["method"]} on the training split only. '
+        f'Metrics at threshold {first["best_model_metrics"]["threshold"]:.2f}; the model was selected by '
+        f'{first["selection_metric"]}.'
+    )
+
+    st.markdown("#### Selected model per target")
+    summary = [{"Target": t, **_metric_row(m["selected_model"], m["best_model_metrics"])} for t, m in metrics.items()]
+    st.dataframe(pd.DataFrame(summary).round(3), hide_index=True, use_container_width=True)
+    st.caption("Rare labels (especially RNF, a random failure with only a handful of test cases) give very noisy metrics.")
+
+    target = st.selectbox("Inspect a target", list(metrics), key="eval_target")
+    m = metrics[target]
+    st.markdown(f"##### {target} · {FAILURE_DESCRIPTIONS.get(target, '')}")
+    counts = {
+        "Full dataset": m["class_counts"], "Training split": m["train_class_counts"],
+        "Test split": m["test_class_counts"],
+    }
+    after = m["resampling"].get("train_class_counts_after")
+    if after:
+        counts["Training split after SMOTE"] = after
+    st.dataframe(
+        pd.DataFrame(counts).T.rename(columns={"0": "No failure (0)", "1": "Failure (1)"}).fillna(0).astype(int),
+        use_container_width=True,
+    )
+
+    comparison = pd.DataFrame([_metric_row(n, e) for n, e in m["model_comparison"].items()])
+    comparison["CV average precision"] = [m["cv_scores"][n]["mean"] for n in comparison["Model"]]
+    comparison["Selected"] = np.where(comparison["Model"] == m["selected_model"], "✓", "")
+    st.markdown("All five models on the test set")
+    st.dataframe(comparison.round(3), hide_index=True, use_container_width=True)
+
+    chosen = st.selectbox(
+        "Model for confusion matrix and per-class metrics", list(m["model_comparison"]),
+        index=list(m["model_comparison"]).index(m["selected_model"]), key="eval_model",
+    )
+    e = m["model_comparison"][chosen]
+    left, right = st.columns(2)
+    with left:
+        st.plotly_chart(
+            _confusion_figure(e["confusion_matrix"]["matrix"], ["No failure (0)", "Failure (1)"],
+                              ["No failure (0)", "Failure (1)"], f"{chosen} · confusion matrix"),
+            use_container_width=True,
+        )
+    with right:
+        per_class = pd.DataFrame(e["per_class"]).T.rename(index={"0": "No failure (0)", "1": "Failure (1)"})
+        per_class.columns = ["Precision", "Recall", "F1", "Support"]
+        st.markdown("Per-class performance")
+        st.dataframe(per_class.round(3), use_container_width=True)
+        st.caption(f'Balanced accuracy {e["balanced_accuracy"]:.3f} · specificity '
+                   f'{e["specificity"] if e["specificity"] is None else round(e["specificity"], 3)}')
+
+    mode = bundle.get("mode_attribution")
+    if mode:
+        st.markdown("#### Failure-mode attribution")
+        st.caption(
+            f'Given a real single-mode failure ({mode["rows_evaluated"]} test rows; {mode["rows_excluded"]} multi-mode or '
+            f'unlabelled failures excluded), the mode with the highest score is the predicted mode. '
+            f'Accuracy {mode["accuracy"]:.3f} · macro-F1 {mode["macro_f1"]:.3f}.'
+        )
+        left, right = st.columns(2)
+        with left:
+            st.plotly_chart(
+                _confusion_figure(mode["confusion_matrix"], mode["labels"], mode["labels"], "Failure mode · confusion matrix"),
+                use_container_width=True,
+            )
+        with right:
+            per_mode = pd.DataFrame(mode["per_class"]).T
+            per_mode.columns = ["Precision", "Recall", "F1", "Support"]
+            st.dataframe(per_mode.round(3), use_container_width=True)
 
 
 def show_turning_result(result: dict) -> None:
@@ -237,7 +428,13 @@ with st.sidebar:
     st.write(f'**Operation:** {config["operation"].title()}')
     st.write(f'**Location:** {config["location"]}')
     st.divider()
-    auto_refresh = st.toggle("Automatically sample new data", value=True)
+    view = VIEW_REPLAY
+    if config["operation"] == "milling":
+        view = st.radio("Milling view", [VIEW_REPLAY, VIEW_MANUAL, VIEW_EVAL], key="milling_view")
+        st.divider()
+    auto_refresh = st.toggle(
+        "Automatically sample new data", value=True, disabled=view != VIEW_REPLAY, key="auto_refresh",
+    ) and view == VIEW_REPLAY
     refresh_seconds = st.select_slider(
         "Sampling refresh interval",
         options=[5, 10, 15, 30, 60],
@@ -246,7 +443,13 @@ with st.sidebar:
         disabled=not auto_refresh,
     )
     threshold = st.slider("Milling failure alert threshold", 0.05, 0.95, 0.50, 0.05)
-    st.caption("Every refresh randomly selects a new row/window from Data/. This is dataset replay, not a physical live sensor connection.")
+    if config["operation"] == "milling":
+        st.caption(
+            "Replay samples a random row from the held-out milling test split, which the model never "
+            "trained on. It is dataset replay, not a physical live sensor connection."
+        )
+    else:
+        st.caption("Every refresh randomly selects a new row/window from Data/. This is dataset replay, not a physical live sensor connection.")
 
 if model_load_error:
     st.error(f"Could not load saved model bundles: {model_load_error}")
@@ -262,20 +465,34 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# Manual prediction and evaluation are static views: no sampling and no auto-refresh.
+if operation == "milling" and view == VIEW_MANUAL:
+    render_manual_milling(models, model_info, threshold)
+    st.stop()
+if operation == "milling" and view == VIEW_EVAL:
+    render_milling_evaluation(models.get("milling"))
+    st.stop()
+
 sample_metadata = {}
 sampling_error = None
 sample_frame = None
 prediction = None
+actual_labels = None
 
-# Always select data from dataSampling.py; no upload or manual data entry is shown.
+# Replay data comes from dataSampling.py. Milling rows come ONLY from the held-out test split.
 try:
     if operation == "milling":
-        sample_frame = sample_milling(n=1, data_dir=DATA_DIR)
+        sample_frame = sample_milling(n=1, data_dir=DATA_DIR, split="test", model_dir=MODEL_DIR)
         sample_metadata = {
             "source_file": str(sample_frame.iloc[0].get("__source_file__", "unknown")),
             "source_row": int(sample_frame.iloc[0].get("__source_row__", -1)),
         }
         reading = sample_frame.iloc[0].to_dict()
+        actual_labels = {
+            label: int(reading[label])
+            for label in ("Machine failure", "TWF", "HDF", "PWF", "OSF", "RNF")
+            if label in reading and pd.notna(reading[label])
+        }
         if "milling" in models:
             prediction = predict_milling(sample_frame, models=models, threshold=threshold)
     elif operation == "turning":
@@ -307,7 +524,8 @@ if sampling_error:
     st.info(f"Check that the dataset exists under `{DATA_DIR / operation}` and has the expected columns.")
 else:
     st.success(
-        f'Random sample selected · Source: {sample_metadata.get("source_file", "dataset window")} · '
+        f'Random {"held-out test row (never used in training)" if operation == "milling" else "sample"} selected · '
+        f'Source: {sample_metadata.get("source_file", "dataset window")} · '
         f'Row/start: {sample_metadata.get("source_row", sample_metadata.get("start_sample", "N/A"))}'
     )
 
@@ -316,9 +534,13 @@ else:
         warnings = rule_based_warnings(reading)
         st.subheader("Milling model output")
         if prediction is not None:
-            show_milling_result(prediction)
+            show_milling_result(prediction, actual=actual_labels)
+            st.caption(
+                "One replayed row says little about accuracy. For overall performance see the "
+                "'Model evaluation' view, computed once on the full held-out test set."
+            )
         else:
-            st.warning("Milling model is unavailable. Run `python model.py` to train it.")
+            st.warning("Milling model is unavailable. Run `python model.py --operation milling` to train it.")
         st.subheader("Sensor checks")
         if warnings:
             for warning in warnings:
@@ -347,7 +569,7 @@ else:
                 fig = px.line(melted, x="Timestamp", y="Reading", color="Sensor", markers=True, template="plotly_white")
                 fig.update_layout(height=360, margin=dict(l=10, r=10, t=30, b=10))
                 st.plotly_chart(fig, use_container_width=True)
-        with st.expander("View the randomly selected source row"):
+        with st.expander("View the randomly selected held-out test row (features and actual labels)"):
             st.dataframe(sample_frame, hide_index=True, use_container_width=True)
 
     elif operation == "turning":
@@ -371,8 +593,9 @@ else:
 
 st.divider()
 st.caption(
-    "Data is randomly sampled from local datasets and refreshed on the selected interval. "
-    "It is not a direct physical sensor feed. Predictions and anomaly flags should be validated before operational use."
+    "Milling rows are replayed from the held-out test split; turning and drilling rows are sampled from the full local "
+    "datasets and refreshed on the selected interval. None of it is a direct physical sensor feed. "
+    "Predictions and anomaly flags should be validated before operational use."
 )
 
 if auto_refresh:

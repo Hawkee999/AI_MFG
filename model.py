@@ -14,7 +14,9 @@ import pandas as pd
 
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import (
+    ExtraTreesClassifier,
     ExtraTreesRegressor,
+    HistGradientBoostingClassifier,
     HistGradientBoostingRegressor,
     IsolationForest,
     RandomForestClassifier,
@@ -24,6 +26,9 @@ from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
+    balanced_accuracy_score,
+    classification_report,
+    confusion_matrix,
     f1_score,
     precision_score,
     recall_score,
@@ -32,9 +37,18 @@ from sklearn.metrics import (
     r2_score,
     roc_auc_score,
 )
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder
+from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder, StandardScaler
+
+# SMOTE lives in imbalanced-learn. Its Pipeline applies resampling only during fit(),
+# so validation/test rows and prediction-time rows are never resampled.
+try:
+    from imblearn.over_sampling import SMOTE, SMOTENC
+    from imblearn.pipeline import Pipeline as ImbPipeline
+except ImportError:
+    SMOTE = SMOTENC = None
+    from sklearn.pipeline import Pipeline as ImbPipeline  # only used when resampling is disabled
 
 # Optional high-performance libraries. The script still runs if either is absent.
 try:
@@ -48,8 +62,16 @@ except ImportError:
     XGBClassifier = XGBRegressor = None
 
 MILLING_FAILURE_TARGETS = ["Machine failure", "TWF", "HDF", "PWF", "OSF", "RNF"]
+MILLING_MODE_TARGETS = ["TWF", "HDF", "PWF", "OSF", "RNF"]
 MILLING_FEATURES = ["Type", "Air temperature [K]", "Process temperature [K]", "Rotational speed [rpm]", "Torque [Nm]", "Tool wear [min]",]
 DRILLING_AXES = ["X", "Y", "Z"]
+
+TEST_SIZE = 0.2             # held-out fraction (never resampled, never trained on)
+RANDOM_STATE = 42
+CV_FOLDS = 5                # inner CV on the training split, used only for model selection
+DEFAULT_THRESHOLD = 0.5
+DEFAULT_SMOTE_RATIO = 0.5   # minority:majority ratio after SMOTE (1.0 = fully balanced)
+HOLDOUT_FILENAME = "holdout_test.csv"
 
 LOG = logging.getLogger("warehouse_model")
 
@@ -65,6 +87,12 @@ def normalize_name(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value).strip()).casefold()
 
 def findData(folder: Path) -> list[Path]:
+    if not folder.exists() and folder.parent.is_dir():
+        # Tolerate folder-name capitalization (Data/Milling vs data/milling) on case-sensitive systems.
+        for child in folder.parent.iterdir():
+            if child.is_dir() and child.name.casefold() == folder.name.casefold():
+                folder = child
+                break
     if not folder.exists():
         return []
 
@@ -133,26 +161,48 @@ def numeric_columns(df: pd.DataFrame, exclude: set[str] | None = None) -> list[s
             result.append(col)
     return result
 
-def make_preprocessor(X: pd.DataFrame) -> ColumnTransformer:
-
+def split_feature_columns(X: pd.DataFrame) -> tuple[list[str], list[str]]:
     num_cols = [
         c for c in X.columns
         if pd.api.types.is_numeric_dtype(X[c])
         and not pd.api.types.is_bool_dtype(X[c])
     ]
     cat_cols = [c for c in X.columns if c not in num_cols]
+    return num_cols, cat_cols
+
+
+def make_preprocessor(
+    X: pd.DataFrame,
+    scale_numeric: bool = False,
+    ordinal_categoricals: bool = False,
+) -> ColumnTransformer:
+    """Numeric columns first, then categorical columns (SMOTENC relies on this order).
+
+    ordinal_categoricals=True encodes each categorical column as ONE integer column so SMOTENC can
+    synthesise valid categories (one-hot columns could be recombined into an invalid all-zero code).
+    The categories are taken from the training frame passed in here.
+    """
+    num_cols, cat_cols = split_feature_columns(X)
     transformers = []
     if num_cols:
-        transformers.append(
-            ("numeric", Pipeline([("imputer", SimpleImputer(strategy="median"))]), num_cols)
-        )
+        numeric_steps = [("imputer", SimpleImputer(strategy="median"))]
+        if scale_numeric:  # keeps SMOTE nearest-neighbour distances from being dominated by rpm
+            numeric_steps.append(("scaler", StandardScaler()))
+        transformers.append(("numeric", Pipeline(numeric_steps), num_cols))
     if cat_cols:
+        if ordinal_categoricals:
+            encoder = OrdinalEncoder(
+                categories=[sorted(X[c].dropna().astype(str).unique()) for c in cat_cols],
+                handle_unknown="use_encoded_value", unknown_value=-1,
+            )
+        else:
+            encoder = OneHotEncoder(handle_unknown="ignore")
         transformers.append(
             (
                 "categorical",
                 Pipeline([
                     ("imputer", SimpleImputer(strategy="most_frequent")),
-                    ("onehot", OneHotEncoder(handle_unknown="ignore")),
+                    ("encoder", encoder),
                 ]),
                 cat_cols,
             )
@@ -185,19 +235,231 @@ def combine_csvs(paths: list[Path]) -> pd.DataFrame:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True, sort=False)
 
-def train_milling(data_dir: Path, model_dir: Path) -> dict:
+# ----------------------------------------------------------------------
+# MILLING: failure / failure-mode classifiers
+#
+# Leakage-safe design:
+#   * ONE stratified train/test split is shared by every target, so a row that is
+#     "test" for one failure label can never be "train" for another.
+#   * SMOTE(NC) lives inside the pipeline: it runs only when .fit() is called on
+#     training data (including the inner CV folds) and never on validation/test rows.
+#   * Model selection uses cross-validation on the TRAINING split only. The test
+#     split is used once, for reporting.
+#   * The saved model is the one that was evaluated (trained on the training split
+#     only). It is NOT refit on the test rows, so the held-out rows stay unseen and
+#     can be safely replayed in the Streamlit simulation.
+# ----------------------------------------------------------------------
+def make_milling_split(df: pd.DataFrame, X: pd.DataFrame, target_cols: list[str]) -> tuple[np.ndarray, np.ndarray]:
+    """Shared stratified split. Strata = the exact combination of failure labels."""
+    usable = np.flatnonzero(X.notna().any(axis=1).to_numpy())
+    labels = (
+        df[target_cols].apply(pd.to_numeric, errors="coerce").fillna(0).astype(int).iloc[usable]
+    )
+    codes = pd.Series(labels.to_numpy() @ (2 ** np.arange(len(target_cols))), index=labels.index)
+    # Label combinations seen fewer than 10 times are pooled so stratification is possible.
+    strata = codes.where(codes.map(codes.value_counts()) >= 10, -1)
+    try:
+        train_pos, test_pos = train_test_split(
+            usable, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=strata.to_numpy()
+        )
+    except ValueError as exc:
+        LOG.warning("Milling: stratified split failed (%s); using an unstratified split.", exc)
+        train_pos, test_pos = train_test_split(usable, test_size=TEST_SIZE, random_state=RANDOM_STATE)
+    return np.sort(train_pos), np.sort(test_pos)
+
+
+def build_milling_pipeline(estimator, X_train: pd.DataFrame, use_smote: bool,
+                           smote_ratio: float, k_neighbors: int) -> ImbPipeline:
+    """preprocess -> (SMOTENC) -> classifier. Resampling is skipped at predict time."""
+    steps: list[tuple[str, Any]] = [
+        ("preprocess", make_preprocessor(X_train, scale_numeric=True, ordinal_categoricals=True))
+    ]
+    if use_smote:
+        num_cols, cat_cols = split_feature_columns(X_train)
+        if cat_cols:
+            sampler = SMOTENC(
+                categorical_features=list(range(len(num_cols), len(num_cols) + len(cat_cols))),
+                sampling_strategy=smote_ratio, k_neighbors=k_neighbors, random_state=RANDOM_STATE,
+            )
+        else:
+            sampler = SMOTE(sampling_strategy=smote_ratio, k_neighbors=k_neighbors, random_state=RANDOM_STATE)
+        steps.append(("resample", sampler))
+    steps.append(("classifier", estimator))
+    return ImbPipeline(steps)
+
+
+def milling_candidates(y_train: pd.Series, use_smote: bool) -> dict[str, Any]:
+    """Five model families. Class weights are used only when SMOTE is off, so the
+    imbalance is never corrected twice."""
+    cw = None if use_smote else "balanced"
+    candidates: dict[str, Any] = {
+        "RandomForest": RandomForestClassifier(
+            n_estimators=400, class_weight=None if use_smote else "balanced_subsample",
+            min_samples_leaf=2, random_state=RANDOM_STATE, n_jobs=-1,
+        ),
+        "ExtraTrees": ExtraTreesClassifier(
+            n_estimators=400, class_weight=cw, min_samples_leaf=2,
+            random_state=RANDOM_STATE, n_jobs=-1,
+        ),
+        "HistGradientBoosting": HistGradientBoostingClassifier(
+            max_iter=300, learning_rate=0.05, class_weight=cw, random_state=RANDOM_STATE,
+        ),
+    }
+    if CatBoostClassifier is not None:
+        candidates["CatBoost"] = CatBoostClassifier(
+            iterations=500, depth=6, learning_rate=0.05, loss_function="Logloss",
+            auto_class_weights=None if use_smote else "Balanced",
+            verbose=False, random_seed=RANDOM_STATE, allow_writing_files=False,
+        )
+    if XGBClassifier is not None:
+        positives = max(1, int((y_train == 1).sum()))
+        negatives = max(1, int((y_train == 0).sum()))
+        candidates["XGBoost"] = XGBClassifier(
+            n_estimators=450, max_depth=4, learning_rate=0.04, subsample=0.9, colsample_bytree=0.9,
+            scale_pos_weight=1.0 if use_smote else negatives / positives,
+            eval_metric="logloss", random_state=RANDOM_STATE, n_jobs=-1,
+        )
+    return candidates
+
+
+def evaluate_binary(y_true, probabilities, threshold: float = DEFAULT_THRESHOLD) -> dict:
+    """Full binary evaluation on held-out data: overall, per-class and confusion matrix."""
+    y_true = np.asarray(y_true).astype(int)
+    probabilities = np.asarray(probabilities, dtype=float)
+    pred = (probabilities >= threshold).astype(int)
+    cm = confusion_matrix(y_true, pred, labels=[0, 1])
+    tn, fp, fn, tp = (int(v) for v in cm.ravel())
+    report = classification_report(
+        y_true, pred, labels=[0, 1], target_names=["0", "1"], output_dict=True, zero_division=0
+    )
+    both_classes = len(np.unique(y_true)) == 2
+    return {
+        "threshold": float(threshold),
+        "test_rows": int(len(y_true)),
+        "test_positives": int(y_true.sum()),
+        "accuracy": float(accuracy_score(y_true, pred)),
+        "balanced_accuracy": float(balanced_accuracy_score(y_true, pred)),
+        "precision": float(precision_score(y_true, pred, zero_division=0)),
+        "recall": float(recall_score(y_true, pred, zero_division=0)),
+        "f1": float(f1_score(y_true, pred, zero_division=0)),
+        "specificity": float(tn / (tn + fp)) if (tn + fp) else None,
+        "roc_auc": float(roc_auc_score(y_true, probabilities)) if both_classes else None,
+        "average_precision": float(average_precision_score(y_true, probabilities)) if both_classes else None,
+        "confusion_matrix": {
+            "labels": [0, 1],
+            "layout": "[[TN, FP], [FN, TP]] (rows = actual, columns = predicted)",
+            "matrix": [[tn, fp], [fn, tp]],
+            "tn": tn, "fp": fp, "fn": fn, "tp": tp,
+        },
+        "per_class": {
+            label: {
+                "precision": float(report[label]["precision"]),
+                "recall": float(report[label]["recall"]),
+                "f1": float(report[label]["f1-score"]),
+                "support": int(report[label]["support"]),
+            }
+            for label in ("0", "1")
+        },
+        "macro_avg": {k: float(report["macro avg"][k]) for k in ("precision", "recall", "f1-score")},
+        "weighted_avg": {k: float(report["weighted avg"][k]) for k in ("precision", "recall", "f1-score")},
+    }
+
+
+def evaluate_mode_attribution(models: dict, X_test: pd.DataFrame, Y_test: pd.DataFrame) -> dict | None:
+    """Given a real single-mode failure, does the highest-scoring mode classifier name the right mode?
+
+    Only test rows with Machine failure = 1 and exactly one failure-mode flag are scored; rows with
+    several simultaneous modes (or none recorded) are excluded and counted.
+    """
+    modes = [t for t in MILLING_MODE_TARGETS if t in models and t in Y_test.columns]
+    if len(modes) < 2:
+        return None
+    flags = Y_test[modes].apply(pd.to_numeric, errors="coerce")
+    is_failure = (
+        pd.to_numeric(Y_test["Machine failure"], errors="coerce") == 1
+        if "Machine failure" in Y_test.columns else flags.sum(axis=1) >= 1
+    )
+    single = is_failure & (flags.sum(axis=1) == 1)
+    if int(single.sum()) == 0:
+        return None
+    scores = np.column_stack([models[m].predict_proba(X_test.loc[single])[:, 1] for m in modes])
+    y_true = flags.loc[single].idxmax(axis=1).to_numpy()
+    y_pred = np.array(modes)[scores.argmax(axis=1)]
+    report = classification_report(y_true, y_pred, labels=modes, output_dict=True, zero_division=0)
+    return {
+        "labels": modes,
+        "rows_evaluated": int(single.sum()),
+        "rows_excluded": int(is_failure.sum() - single.sum()),
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "macro_f1": float(f1_score(y_true, y_pred, labels=modes, average="macro", zero_division=0)),
+        "confusion_matrix": confusion_matrix(y_true, y_pred, labels=modes).tolist(),
+        "confusion_layout": "rows = actual mode, columns = predicted mode (order = labels)",
+        "per_class": {
+            m: {
+                "precision": float(report[m]["precision"]),
+                "recall": float(report[m]["recall"]),
+                "f1": float(report[m]["f1-score"]),
+                "support": int(report[m]["support"]),
+            }
+            for m in modes
+        },
+        "note": "Scored only on held-out failures with exactly one recorded mode; excludes multi-mode failures.",
+    }
+
+
+def log_milling_evaluation(metrics: dict, mode_attribution: dict | None) -> None:
+    """Readable evaluation tables for the console (everything here is computed on the held-out test split)."""
+    LOG.info("=" * 70)
+    LOG.info("MILLING EVALUATION (held-out test split, threshold %.2f)", DEFAULT_THRESHOLD)
+    for target, m in metrics.items():
+        LOG.info("-" * 70)
+        LOG.info("[%s] test rows=%s positives=%s | resampling=%s | selected by CV: %s",
+                 target, m["test_rows"], m["test_class_counts"].get("1", 0),
+                 m["resampling"]["method"], m["selected_model"])
+        LOG.info("  %-21s %6s %6s %6s %6s %7s %7s | %5s %4s %4s %4s",
+                 "model", "acc", "prec", "rec", "f1", "roc_auc", "pr_auc", "TN", "FP", "FN", "TP")
+        for name, e in m["model_comparison"].items():
+            cm = e["confusion_matrix"]
+            auc = "    n/a" if e["roc_auc"] is None else f"{e['roc_auc']:7.3f}"
+            pr = "    n/a" if e["average_precision"] is None else f"{e['average_precision']:7.3f}"
+            LOG.info("%s %-21s %6.3f %6.3f %6.3f %6.3f %s %s | %5d %4d %4d %4d",
+                     "*" if name == m["selected_model"] else " ", name,
+                     e["accuracy"], e["precision"], e["recall"], e["f1"], auc, pr,
+                     cm["tn"], cm["fp"], cm["fn"], cm["tp"])
+        for label, p in m["best_model_metrics"]["per_class"].items():
+            LOG.info("  selected, class %s: precision=%.3f recall=%.3f f1=%.3f support=%d",
+                     label, p["precision"], p["recall"], p["f1"], p["support"])
+    if mode_attribution:
+        LOG.info("-" * 70)
+        LOG.info("FAILURE-MODE ATTRIBUTION (given a real single-mode failure): rows=%s accuracy=%.3f macro-F1=%.3f",
+                 mode_attribution["rows_evaluated"], mode_attribution["accuracy"], mode_attribution["macro_f1"])
+        LOG.info("  labels (rows=actual, cols=predicted): %s", mode_attribution["labels"])
+        for label, row in zip(mode_attribution["labels"], mode_attribution["confusion_matrix"]):
+            LOG.info("  %-4s %s", label, row)
+        for label, p in mode_attribution["per_class"].items():
+            LOG.info("  %-4s precision=%.3f recall=%.3f f1=%.3f support=%d",
+                     label, p["precision"], p["recall"], p["f1"], p["support"])
+    LOG.info("=" * 70)
+
+
+class MillingDataError(Exception):
+    """Milling data could not be prepared; the message is reported as the skip reason."""
+
+
+def prepare_milling_data(data_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str]]:
+    """Load the milling CSV(s). Returns (df, X features, Y labels, available label names)."""
     paths = findData(data_dir / "milling")
     if not paths:
         LOG.warning("Milling: no CSV found in %s; skipping.", data_dir / "milling")
-        return {"status": "skipped", "reason": "No milling CSV found"}
+        raise MillingDataError("No milling CSV found")
 
     df = combine_csvs(paths)
     if df.empty:
-        return {"status": "skipped", "reason": "Milling files could not be read"}
+        raise MillingDataError("Milling files could not be read")
 
     # Find columns case/whitespace-insensitively, then rename to expected names.
     rename_map = {}
-    for expected in MILLING_FEATURES + MILLING_FAILURE_TARGETS:
+    for expected in MILLING_FEATURES + MILLING_FAILURE_TARGETS + ["UDI", "Product ID"]:
         actual = find_column(df, [expected])
         if actual is not None:
             rename_map[actual] = expected
@@ -207,7 +469,7 @@ def train_milling(data_dir: Path, model_dir: Path) -> dict:
     if missing_features:
         LOG.warning("Milling: missing required features %s; skipping.", missing_features)
         LOG.warning("Milling columns found: %s", list(df.columns))
-        return {"status": "skipped", "reason": f"Missing features: {missing_features}"}
+        raise MillingDataError(f"Missing features: {missing_features}")
 
     # Avoid identifiers, source filenames and all output labels as input features.
     X = df[MILLING_FEATURES].copy()
@@ -217,124 +479,116 @@ def train_milling(data_dir: Path, model_dir: Path) -> dict:
             X[col] = pd.to_numeric(X[col], errors="coerce")
     X = X.replace([np.inf, -np.inf], np.nan)
 
-    trained = {}
-    metrics = {}
-    for target in MILLING_FAILURE_TARGETS:
-        if target not in df.columns:
-            LOG.warning("Milling target '%s' missing; it will not be trained.", target)
-            continue
+    available_targets = [t for t in MILLING_FAILURE_TARGETS if t in df.columns]
+    for t in MILLING_FAILURE_TARGETS:
+        if t not in df.columns:
+            LOG.warning("Milling target '%s' missing; it will not be trained.", t)
+    if not available_targets:
+        raise MillingDataError("No failure label columns found")
+    Y = df[available_targets].apply(pd.to_numeric, errors="coerce")
+    return df, X, Y, available_targets
 
-        y = pd.to_numeric(df[target], errors="coerce")
-        valid = y.isin([0, 1]) & X.notna().any(axis=1)
-        X_t = X.loc[valid].copy()
-        y_t = y.loc[valid].astype(int)
-        counts = y_t.value_counts().to_dict()
+
+def train_milling(data_dir: Path, model_dir: Path, resampling: str = "smote",
+                  smote_ratio: float = DEFAULT_SMOTE_RATIO) -> dict:
+    use_smote = resampling == "smote"
+    if use_smote and SMOTENC is None:
+        raise ImportError("SMOTE resampling needs imbalanced-learn: pip install imbalanced-learn "
+                          "(or run with --resampling none to use class weights instead).")
+    try:
+        df, X, Y, available_targets = prepare_milling_data(data_dir)
+    except MillingDataError as exc:
+        return {"status": "skipped", "reason": str(exc)}
+
+    # One split for all targets, made BEFORE any resampling, scaling or model fitting.
+    train_pos, test_pos = make_milling_split(df, X, available_targets)
+    LOG.info("Milling split: %s train rows / %s held-out test rows (stratified on label combination, seed %s)",
+             len(train_pos), len(test_pos), RANDOM_STATE)
+
+    trained: dict[str, Any] = {}
+    metrics: dict[str, dict] = {}
+    for target in available_targets:
+        y_all = Y[target]
+        tr = train_pos[y_all.iloc[train_pos].isin([0, 1]).to_numpy()]
+        te = test_pos[y_all.iloc[test_pos].isin([0, 1]).to_numpy()]
+        X_train, y_train = X.iloc[tr], y_all.iloc[tr].astype(int)
+        X_test, y_test = X.iloc[te], y_all.iloc[te].astype(int)
+        counts = y_all[y_all.isin([0, 1])].astype(int).value_counts().to_dict()
+        train_counts = y_train.value_counts().to_dict()
 
         # Do not create fake probabilities from a single-class dataset.
         if len(counts) < 2:
-            LOG.warning(
-                "Milling target '%s' skipped: needs both 0 and 1 labels; observed %s.",
-                target, counts
-            )
+            LOG.warning("Milling target '%s' skipped: needs both 0 and 1 labels; observed %s.", target, counts)
             continue
-        if min(counts.values()) < 3 or len(y_t) < 20:
-            LOG.warning(
-                "Milling target '%s' skipped: only %s rows / class counts %s. "
-                "Use the full labeled dataset for a more reliable classifier.",
-                target, len(y_t), counts
-            )
+        if min(counts.values()) < 3 or sum(counts.values()) < 20 or len(train_counts) < 2:
+            LOG.warning("Milling target '%s' skipped: class counts %s are too small.", target, counts)
             continue
 
-        # Holdout split only when both classes can be represented in the test set.
-        test_count = max(2, int(round(len(y_t) * 0.2)))
-        stratify = y_t if min(counts.values()) >= 2 and test_count >= 2 else None
-        X_train, X_test, y_train, y_test = train_test_split(
-            X_t, y_t, test_size=0.2, random_state=42, stratify=stratify
-        )
-        # Compare several model families on the same holdout. Average precision
-        # is the selection metric because positive failure labels are very rare.
-        candidates = {
-            "RandomForest": RandomForestClassifier(
-                n_estimators=400, class_weight="balanced_subsample",
-                min_samples_leaf=2, random_state=42, n_jobs=-1,
-            ),
-            "ExtraTrees": __import__("sklearn.ensemble", fromlist=["ExtraTreesClassifier"]).ExtraTreesClassifier(
-                n_estimators=400, class_weight="balanced", min_samples_leaf=2,
-                random_state=42, n_jobs=-1,
-            ),
-        }
-        if CatBoostClassifier is not None:
-            candidates["CatBoost"] = CatBoostClassifier(
-                iterations=500, depth=6, learning_rate=0.05,
-                loss_function="Logloss", auto_class_weights="Balanced",
-                verbose=False, random_seed=42, allow_writing_files=False,
-            )
-        if XGBClassifier is not None:
-            positives = max(1, int((y_train == 1).sum()))
-            negatives = max(1, int((y_train == 0).sum()))
-            candidates["XGBoost"] = XGBClassifier(
-                n_estimators=450, max_depth=4, learning_rate=0.04,
-                subsample=0.9, colsample_bytree=0.9,
-                scale_pos_weight=negatives / positives,
-                eval_metric="logloss", random_state=42, n_jobs=-1,
-            )
+        n_minority = min(train_counts.values())
+        folds = min(CV_FOLDS, n_minority)
+        if folds < 2:
+            LOG.warning("Milling target '%s' skipped: only %s minority training rows.", target, n_minority)
+            continue
+        # SMOTE needs k_neighbors < minority rows in every (smaller) CV training fold.
+        minority_in_fold = n_minority - int(np.ceil(n_minority / folds))
+        k_neighbors = max(1, min(5, minority_in_fold - 1))
+        cv = StratifiedKFold(n_splits=folds, shuffle=True, random_state=RANDOM_STATE)
 
-        comparison = {}
-        fitted = {}
-        for name, estimator in candidates.items():
-            candidate = Pipeline([
-                ("preprocess", make_preprocessor(X_train)),
-                ("classifier", estimator),
-            ])
+        comparison, cv_scores, fitted = {}, {}, {}
+        for name, estimator in milling_candidates(y_train, use_smote).items():
+            candidate = build_milling_pipeline(estimator, X_train, use_smote, smote_ratio, k_neighbors)
             try:
-                candidate.fit(X_train, y_train)
-                probabilities = candidate.predict_proba(X_test)[:, 1]
-                predictions = (probabilities >= 0.5).astype(int)
-                ap = float(average_precision_score(y_test, probabilities))
-                comparison[name] = {
-                    "average_precision": ap,
-                    "roc_auc": float(roc_auc_score(y_test, probabilities)),
-                    "f1_at_0_5": float(f1_score(y_test, predictions, zero_division=0)),
-                    "precision_at_0_5": float(precision_score(y_test, predictions, zero_division=0)),
-                    "recall_at_0_5": float(recall_score(y_test, predictions, zero_division=0)),
-                    "accuracy_at_0_5": float(accuracy_score(y_test, predictions)),
-                }
+                # Selection metric: average precision on validation folds of the TRAINING split.
+                # SMOTE is applied only to each fold's training part, never to its validation part.
+                scores = cross_val_score(candidate, X_train, y_train, cv=cv, scoring="average_precision")
+                cv_scores[name] = {"mean": float(np.mean(scores)), "std": float(np.std(scores)), "folds": int(folds)}
+                candidate.fit(X_train, y_train)  # resamples X_train/y_train only
+                comparison[name] = evaluate_binary(y_test, candidate.predict_proba(X_test)[:, 1])
                 fitted[name] = candidate
-                LOG.info("Milling %s / %s comparison: %s", target, name, comparison[name])
+                LOG.info("Milling %s / %s: CV AP %.3f | test F1 %.3f",
+                         target, name, cv_scores[name]["mean"], comparison[name]["f1"])
             except Exception as exc:
                 LOG.warning("Milling candidate %s failed for %s: %s", name, target, exc)
 
         if not fitted:
             LOG.warning("All milling candidate models failed for target %s", target)
             continue
-        best_name = max(comparison, key=lambda name: comparison[name]["average_precision"])
-        # Refit the selected model on every labelled row after holdout evaluation,
-        # so the saved production model does not discard the holdout rows.
-        pipeline = fitted[best_name]
-        pipeline.fit(X_t, y_t)
-        selected_metrics = comparison[best_name]
+        # Chosen on training-split CV only; test metrics did not influence the choice.
+        best_name = max(cv_scores, key=lambda n: cv_scores[n]["mean"])
+        pipeline = fitted[best_name]  # already fit on the training split only; NOT refit on test rows
+
+        resampling_info: dict[str, Any] = {
+            "method": "SMOTENC" if use_smote else "class_weight",
+            "applied_to": "training split only (inside each CV training fold and the final fit)",
+        }
+        if use_smote:
+            _, y_resampled = pipeline[:-1].fit_resample(X_train, y_train)
+            resampling_info.update({
+                "sampling_strategy": float(smote_ratio),
+                "k_neighbors": int(k_neighbors),
+                "train_class_counts_before": {str(k): int(v) for k, v in train_counts.items()},
+                "train_class_counts_after": {str(k): int(v) for k, v in pd.Series(y_resampled).value_counts().items()},
+            })
+
         metric = {
-            "rows": int(len(y_t)),
+            "rows": int(sum(counts.values())),
+            "train_rows": int(len(y_train)),
+            "test_rows": int(len(y_test)),
             "class_counts": {str(k): int(v) for k, v in counts.items()},
+            "train_class_counts": {str(k): int(v) for k, v in train_counts.items()},
+            "test_class_counts": {str(k): int(v) for k, v in y_test.value_counts().items()},
+            "resampling": resampling_info,
             "selected_model": best_name,
-            "selection_metric": "average_precision (PR-AUC approximation)",
-            "best_model_metrics": selected_metrics,
+            "selection_metric": f"{folds}-fold CV average precision on the training split only",
+            "cv_scores": cv_scores,
+            "best_model_metrics": comparison[best_name],
             "model_comparison": comparison,
-            "warning": "Holdout metrics are used for model selection; use a separate untouched test set for final unbiased evaluation.",
+            "note": "Metrics are on the held-out test split at threshold "
+                    f"{DEFAULT_THRESHOLD}. The model was not refit on these rows.",
         }
         trained[target] = pipeline
         metrics[target] = metric
-        LOG.info("Milling target %s metrics: %s", target, metric)
 
-    bundle = {
-        "operation": "milling",
-        "model_type": "one binary classifier per available failure label",
-        "feature_columns": MILLING_FEATURES,
-        "target_columns": list(trained.keys()),
-        "models": trained,
-        "metrics": metrics,
-        "note": "Probability is model-estimated, not a guarantee of failure.",
-    }
     if not trained:
         LOG.warning("Milling: no target had enough positive and negative labels to train.")
         return {
@@ -342,8 +596,57 @@ def train_milling(data_dir: Path, model_dir: Path) -> dict:
             "reason": "No eligible failure target. Need full data with both 0 and 1 for at least one label.",
             "rows": len(df),
         }
+
+    X_eval, Y_eval = X.iloc[test_pos], Y.iloc[test_pos]
+    mode_attribution = evaluate_mode_attribution(trained, X_eval, Y_eval)
+    log_milling_evaluation(metrics, mode_attribution)
+
+    # Held-out rows are saved so the Streamlit simulation can replay ONLY unseen data.
+    holdout_cols = [c for c in ["UDI", "Product ID"] if c in df.columns]
+    holdout = pd.concat([df.iloc[test_pos][holdout_cols], X.iloc[test_pos], df.iloc[test_pos][available_targets]], axis=1)
+    holdout["__source_file__"] = df["__source_file__"].iloc[test_pos].to_numpy()
+    holdout["__source_row__"] = df.groupby("__source_file__").cumcount().iloc[test_pos].to_numpy()
+    out_dir = model_dir / "milling"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    holdout.to_csv(out_dir / HOLDOUT_FILENAME, index=False)
+    LOG.info("Saved %s held-out test rows: %s", len(holdout), out_dir / HOLDOUT_FILENAME)
+
+    numeric_cols = [c for c in MILLING_FEATURES if c != "Type"]
+    bundle = {
+        "operation": "milling",
+        "model_type": "one binary classifier per available failure label"
+                      + (" (SMOTENC on the training split only)" if use_smote else " (class weights)"),
+        "feature_columns": MILLING_FEATURES,
+        "target_columns": list(trained.keys()),
+        "models": trained,
+        "metrics": metrics,
+        "mode_attribution": mode_attribution,
+        "feature_ranges": {
+            c: {"min": float(X.iloc[train_pos][c].min()), "max": float(X.iloc[train_pos][c].max()),
+                "median": float(X.iloc[train_pos][c].median())}
+            for c in numeric_cols
+        },
+        "category_values": {"Type": sorted(X.iloc[train_pos]["Type"].unique().tolist())},
+        "split": {
+            "test_size": TEST_SIZE, "random_state": RANDOM_STATE,
+            "train_rows": int(len(train_pos)), "test_rows": int(len(test_pos)),
+            "holdout_file": HOLDOUT_FILENAME,
+            "stratified_on": "combination of all failure labels (rare combinations pooled)",
+            "models_trained_on": "training split only (not refit on test rows)",
+        },
+        "note": "Scores are model-estimated risk, not guarantees. With SMOTE the scores are not calibrated "
+                "probabilities, so treat the threshold as an operating point, not a literal percentage.",
+    }
     save_bundle(model_dir, "milling", bundle)
-    return {"status": "trained", "rows": len(df), "targets": list(trained), "metrics": metrics}
+    (out_dir / "metrics.json").write_text(
+        json.dumps({"metrics": metrics, "mode_attribution": mode_attribution, "split": bundle["split"]},
+                   indent=2, default=str),
+        encoding="utf-8",
+    )
+    return {
+        "status": "trained", "rows": len(df), "targets": list(trained),
+        "split": bundle["split"], "metrics": metrics, "mode_attribution": mode_attribution,
+    }
 
 
 # ----------------------------------------------------------------------
@@ -630,6 +933,10 @@ def get_model_info(
                     }
                     for target in bundle.get("target_columns", [])
                 },
+                "feature_ranges": bundle.get("feature_ranges", {}),
+                "category_values": bundle.get("category_values", {}),
+                "split": bundle.get("split"),
+                "has_evaluation": any("test_rows" in m for m in bundle.get("metrics", {}).values()),
             }
         elif operation == "turning":
             info[operation] = {
@@ -673,13 +980,46 @@ def _as_frame(data: dict | list[dict] | pd.DataFrame, expected: list[str], opera
     return frame
 
 
+def derive_failure_mode(failures: dict, threshold: float = DEFAULT_THRESHOLD) -> dict:
+    """Turn per-target scores into one failure decision and one most-likely failure mode.
+
+    A failure is predicted when the 'Machine failure' score or any mode score reaches the threshold.
+    If so, the primary mode is the mode classifier with the highest score (even if it is below the
+    threshold, in which case the mode is reported as low-confidence). Otherwise: 'No failure'.
+    """
+    mode_scores = {t: float(v["probability"]) for t, v in failures.items() if t in MILLING_MODE_TARGETS}
+    machine = failures.get("Machine failure")
+    failure_score = float(machine["probability"]) if machine else (max(mode_scores.values()) if mode_scores else 0.0)
+    flagged = sorted((t for t, p in mode_scores.items() if p >= threshold), key=lambda t: -mode_scores[t])
+    predicted = failure_score >= threshold or bool(flagged)
+    primary, confident = "No failure", True
+    if predicted:
+        if flagged:
+            primary = flagged[0]
+        elif mode_scores:
+            primary, confident = max(mode_scores, key=mode_scores.get), False
+        else:
+            primary, confident = "Unknown (no mode models trained)", False
+    return {
+        "predicted_failure": bool(predicted),
+        "failure_score": failure_score,
+        "predicted_failure_mode": primary,
+        "failure_mode_confident": bool(confident),
+        "flagged_modes": flagged,
+        "mode_scores": mode_scores,
+    }
+
+
 def predict_milling(
     data: dict | list[dict] | pd.DataFrame,
     models: dict[str, dict] | None = None,
     model_dir: str | Path = "models",
-    threshold: float = 0.5,
+    threshold: float = DEFAULT_THRESHOLD,
 ) -> dict:
-    """Predict milling failure probabilities. Input keys are MILLING_FEATURES.
+    """Predict milling failure risk and failure mode. Input keys are MILLING_FEATURES.
+
+    Each prediction has per-target scores under "failures", plus "predicted_failure",
+    "predicted_failure_mode", "flagged_modes" and "mode_scores".
 
     Example: predict_milling({"Type":"M", "Air temperature [K]":298.1,
       "Process temperature [K]":308.6, "Rotational speed [rpm]":1500,
@@ -710,7 +1050,11 @@ def predict_milling(
                 "threshold": float(threshold),
                 "selected_model": bundle.get("metrics", {}).get(target, {}).get("selected_model", "unknown"),
             }
-        results.append({"failures": failures, "any_failure_predicted": any(v["predicted_failure"] for v in failures.values())})
+        results.append({
+            "failures": failures,
+            "any_failure_predicted": any(v["predicted_failure"] for v in failures.values()),
+            **derive_failure_mode(failures, threshold),
+        })
     return {"operation": "milling", "count": len(results), "predictions": results}
 
 
@@ -818,43 +1162,64 @@ def predict_tool_condition(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Train milling, turning and drilling tool models.")
-    parser.add_argument("--data-dir", default="data", help="Folder containing milling/turning/drilling subfolders")
+    parser.add_argument("--data-dir", default="Data", help="Folder containing milling/turning/drilling subfolders")
     parser.add_argument("--model-dir", default="models", help="Output folder for trained model bundles")
+    parser.add_argument("--operation", choices=["all", "milling", "turning", "drilling"], default="all",
+                        help="Which model(s) to train. Other operations' saved models/reports are left untouched.")
+    parser.add_argument("--resampling", choices=["smote", "none"], default="smote",
+                        help="Milling class-imbalance handling: SMOTE on the training split only (default) "
+                             "or none (class weights, no resampling).")
+    parser.add_argument("--smote-ratio", type=float, default=DEFAULT_SMOTE_RATIO,
+                        help="Milling SMOTE target minority:majority ratio on training data (default 0.5).")
     parser.add_argument("--drilling-window", type=int, default=1000,
                         help="Raw drilling samples per feature window (default 1000 at 1000 Hz = 1 second)")
     args = parser.parse_args()
+    if not 0.0 < args.smote_ratio <= 1.0:
+        parser.error("--smote-ratio must be in (0, 1]")
 
     configure_logging()
     data_dir = Path(args.data_dir)
     model_dir = Path(args.model_dir)
     model_dir.mkdir(parents=True, exist_ok=True)
+    wanted = {"milling", "turning", "drilling"} if args.operation == "all" else {args.operation}
 
     LOG.info("=" * 70)
-    LOG.info("Starting combined tool-wear model training")
+    LOG.info("Starting combined tool-wear model training (%s)", args.operation)
     LOG.info("Data directory: %s", data_dir.resolve())
     LOG.info("Model directory: %s", model_dir.resolve())
     LOG.info("=" * 70)
 
-    results = {
-        "optional_dependencies": {
-            "catboost_available": CatBoostClassifier is not None,
-            "xgboost_available": XGBClassifier is not None,
-            "install_hint": "Install optional candidates with: pip install catboost xgboost",
-        },
-        "milling": train_milling(data_dir, model_dir),
-        "turning": train_turning(data_dir, model_dir),
-        "drilling": train_drilling(data_dir, model_dir, window_size=args.drilling_window),
-    }
-
     report_path = model_dir / "training_report.json"
+    results: dict[str, Any] = {}
+    if args.operation != "all" and report_path.exists():
+        try:  # keep the previous results of operations that are not retrained
+            results = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            results = {}
+    results["optional_dependencies"] = {
+        "catboost_available": CatBoostClassifier is not None,
+        "xgboost_available": XGBClassifier is not None,
+        "imbalanced_learn_available": SMOTENC is not None,
+        "install_hint": "Install optional candidates with: pip install catboost xgboost imbalanced-learn",
+    }
+    if "milling" in wanted:
+        results["milling"] = train_milling(data_dir, model_dir, resampling=args.resampling, smote_ratio=args.smote_ratio)
+    if "turning" in wanted:
+        results["turning"] = train_turning(data_dir, model_dir)
+    if "drilling" in wanted:
+        results["drilling"] = train_drilling(data_dir, model_dir, window_size=args.drilling_window)
+
     report_path.write_text(json.dumps(results, indent=2, default=str), encoding="utf-8")
     LOG.info("=" * 70)
     LOG.info("TRAINING SUMMARY")
-    for operation, result in results.items():
+    for operation in ("milling", "turning", "drilling"):
+        result = results.get(operation)
+        if not result or operation not in wanted:
+            continue
         LOG.info("%s: %s", operation.upper(), result.get("status", "unknown"))
         if result.get("reason"):
             LOG.info("  Reason: %s", result["reason"])
-        if result.get("metrics"):
+        if operation != "milling" and result.get("metrics"):  # milling tables were already logged in full
             LOG.info("  Metrics: %s", result["metrics"])
     LOG.info("Training report saved to %s", report_path.resolve())
     LOG.info("=" * 70)

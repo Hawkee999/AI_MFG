@@ -116,19 +116,47 @@ def _rename_known_columns(frame: pd.DataFrame, expected: Iterable[str]) -> pd.Da
     return frame.rename(columns=rename)
 
 
+MILLING_LABELS = ["Machine failure", "TWF", "HDF", "PWF", "OSF", "RNF"]
+MILLING_HOLDOUT_FILENAME = "holdout_test.csv"  # written by model.py next to the milling model
+
+
 def sample_milling(
     n: int = 1,
     data_dir: str | Path = "Data",
     random_state: int | None = None,
+    split: str = "test",
+    model_dir: str | Path = "models",
 ) -> pd.DataFrame:
-    """Return n random milling rows with the six model input columns only.
+    """Return n random milling rows with the six model input columns.
 
-    Sampling is uniform across all readable milling files. If n exceeds the number
-    of rows, sampling is performed with replacement. Use the returned DataFrame
-    directly with model.predict_milling().
+    split="test" (default): sample ONLY from the held-out test rows saved by model.py
+        (models/milling/holdout_test.csv). The milling model never trained on these rows, so
+        predictions on them are an honest replay. The true failure labels are included so the
+        UI can show actual vs predicted.
+    split="full": sample from every row of Data/milling. Those rows include the ones the model was
+        trained on, so do not use this to judge accuracy.
+
+    If n exceeds the number of rows, sampling is performed with replacement. Use the returned
+    DataFrame directly with model.predict_milling().
     """
     if n < 1:
         raise ValueError("n must be at least 1")
+    if split not in {"test", "full"}:
+        raise ValueError('split must be "test" or "full"')
+    if split == "test":
+        holdout_path = Path(model_dir).expanduser().resolve() / "milling" / MILLING_HOLDOUT_FILENAME
+        if not holdout_path.is_file():
+            raise FileNotFoundError(
+                f"Held-out milling test rows not found at {holdout_path}. "
+                "Retrain with `python model.py --operation milling` to create them."
+            )
+        pool = pd.read_csv(holdout_path)
+        missing = [col for col in MILLING_FEATURES if col not in pool.columns]
+        if missing or pool.empty:
+            raise ValueError(f"{holdout_path} is empty or missing columns {missing}. Retrain the milling model.")
+        keep = MILLING_FEATURES + [c for c in MILLING_LABELS if c in pool.columns] + ["__source_file__", "__source_row__"]
+        pool = pool[[c for c in keep if c in pool.columns]]
+        return pool.sample(n=n, replace=n > len(pool), random_state=random_state).reset_index(drop=True)
     frames = []
     for path, frame in _load_frames("milling", data_dir):
         frame = _rename_known_columns(frame, MILLING_FEATURES)
